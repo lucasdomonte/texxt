@@ -33,6 +33,7 @@ yarn-error.log*
 *.db
 *.sqlite
 *.sqlite3
+/data/
 
 # Bun
 .bun

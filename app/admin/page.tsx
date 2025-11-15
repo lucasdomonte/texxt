@@ -2,6 +2,16 @@
 
 import { useState, useEffect } from 'react';
 import { useRouter } from 'next/navigation';
+import { useQuery, useMutation } from '@apollo/client/react';
+import {
+  ADMIN_LOGIN,
+  ADMIN_DOCS,
+  ADMIN_BLOCK_DOC,
+  ADMIN_UNBLOCK_DOC,
+  ADMIN_CHANGE_PASSWORD,
+  ADMIN_CHANGE_DOC_PASSWORD_ADMIN,
+} from '@/lib/graphql/queries';
+import { client } from '@/lib/apollo-client';
 
 interface Doc {
   path: string;
@@ -20,8 +30,7 @@ export default function AdminPage() {
   const [isAuthenticated, setIsAuthenticated] = useState(false);
   const [password, setPassword] = useState('');
   const [passwordError, setPasswordError] = useState('');
-  const [docs, setDocs] = useState<Doc[]>([]);
-  const [loading, setLoading] = useState(false);
+  const [token, setToken] = useState<string | null>(null);
   const [showBlockModal, setShowBlockModal] = useState(false);
   const [selectedDoc, setSelectedDoc] = useState<string | null>(null);
   const [blockReason, setBlockReason] = useState('');
@@ -36,161 +45,108 @@ export default function AdminPage() {
   const [confirmPasswordInput, setConfirmPasswordInput] = useState('');
   const [changePasswordError, setChangePasswordError] = useState('');
 
-  // Fazer login e obter token
-  const doLogin = async (pwd: string): Promise<string | null> => {
-    try {
-      
-      // Enviar senha via query param (workaround para bug do custom server com body)
-      const url = `/api/admin/login?password=${encodeURIComponent(pwd)}`;
-      
-      const controller = new AbortController();
-      const timeoutId = setTimeout(() => {
-        controller.abort();
-      }, 10000);
-
-      const response = await fetch(url, {
-        method: 'POST',
-        signal: controller.signal,
-      });
-
-      clearTimeout(timeoutId);
-
-      if (!response.ok) {
-        const errorData = await response.json().catch(() => ({ error: 'Erro desconhecido' }));
-        setPasswordError(errorData.error || 'Senha incorreta');
-        return null;
-      }
-
-      const data = await response.json();
-      return data.token;
-    } catch (error: any) {
-      if (error.name === 'AbortError') {
-        setPasswordError('Timeout: A requisição demorou muito tempo. Tente novamente.');
-      } else {
-        setPasswordError('Erro ao fazer login: ' + error.message);
-      }
-      return null;
-    }
-  };
-
-  // Carregar documentos
-  const loadDocs = async (token: string) => {
-    setLoading(true);
-    try {
-      const response = await fetch('/api/admin/docs', {
-        headers: {
-          'Authorization': `Bearer ${token}`,
-        },
-      });
-
-      if (!response.ok) {
-        if (response.status === 401) {
-          setPasswordError('Sessão expirada');
-          setIsAuthenticated(false);
-          localStorage.removeItem('adminToken');
-          return;
-        }
-        throw new Error('Erro ao carregar documentos');
-      }
-
-      const data = await response.json();
-      setDocs(data.docs);
+  // GraphQL Mutation para login
+  const [adminLoginMutation] = useMutation(ADMIN_LOGIN, {
+    onCompleted: (data: any) => {
+      const newToken = data.adminLogin;
+      setToken(newToken);
       setIsAuthenticated(true);
-      localStorage.setItem('adminToken', token);
-    } catch (error) {
-      setPasswordError('Erro ao carregar documentos');
-    } finally {
-      setLoading(false);
+      localStorage.setItem('adminToken', newToken);
+      setIsLoggingIn(false);
+    },
+    onError: (error: any) => {
+      setPasswordError(error.message || 'Senha incorreta');
+      setIsLoggingIn(false);
+    },
+  });
+
+  // GraphQL Query para documentos (com contexto de autenticação)
+  const { data: docsData, loading: docsLoading, error: docsError, refetch: refetchDocs } = useQuery(ADMIN_DOCS, {
+    skip: !isAuthenticated || !token,
+    context: {
+      headers: {
+        authorization: token ? `Bearer ${token}` : '',
+      },
+    },
+  });
+
+  // Tratar erros de autenticação
+  useEffect(() => {
+    if (docsError) {
+      const errorMessage = docsError.message || '';
+      if (errorMessage.includes('Não autorizado') || errorMessage.includes('não autorizado')) {
+        setIsAuthenticated(false);
+        setToken(null);
+        localStorage.removeItem('adminToken');
+      }
     }
-  };
+  }, [docsError]);
+
+  // GraphQL Mutations
+  const [blockDocMutation] = useMutation(ADMIN_BLOCK_DOC);
+  const [unblockDocMutation] = useMutation(ADMIN_UNBLOCK_DOC);
+  const [changePasswordMutation] = useMutation(ADMIN_CHANGE_PASSWORD);
+  const [changeDocPasswordMutation] = useMutation(ADMIN_CHANGE_DOC_PASSWORD_ADMIN);
+
+  const docs: Doc[] = (docsData as any)?.adminDocs || [];
 
   // Login
   const handleLogin = async (e: React.FormEvent) => {
     e.preventDefault();
     setPasswordError('');
     setIsLoggingIn(true);
-    
-    try {
-      const token = await doLogin(password);
-      
-      if (token) {
-        await loadDocs(token);
-      }
-    } catch (error) {
-      setPasswordError('Erro ao fazer login');
-    } finally {
-      setIsLoggingIn(false);
-    }
+    await adminLoginMutation({
+      variables: { password },
+    });
   };
 
   // Bloquear/Desbloquear
   const handleToggleBlock = async (path: string, isBlocked: boolean) => {
-    const token = localStorage.getItem('adminToken');
     if (!token) return;
 
     if (!isBlocked) {
-      // Abrir modal para bloquear
       setSelectedDoc(path);
       setShowBlockModal(true);
       return;
     }
 
-    // Desbloquear diretamente
     try {
-      const url = `/api/admin/docs?path=${encodeURIComponent(path)}&action=unblock`;
-      const response = await fetch(url, {
-        method: 'POST',
-        headers: {
-          'Authorization': `Bearer ${token}`,
+      await unblockDocMutation({
+        variables: { path },
+        context: {
+          headers: {
+            authorization: `Bearer ${token}`,
+          },
         },
       });
-
-      if (response.ok) {
-        loadDocs(token);
-      }
+      refetchDocs();
     } catch (error) {
+      console.error('Erro ao desbloquear:', error);
     }
   };
 
   // Confirmar bloqueio
   const handleConfirmBlock = async () => {
-    if (!selectedDoc) {
-      return;
-    }
-
-    const token = localStorage.getItem('adminToken');
-    if (!token) {
-      return;
-    }
+    if (!selectedDoc || !token) return;
 
     setIsBlocking(true);
 
     try {
-      
-      // Enviar via query params (workaround para custom server)
-      let url = `/api/admin/docs?path=${encodeURIComponent(selectedDoc)}&action=block`;
-      if (blockReason) {
-        url += `&reason=${encodeURIComponent(blockReason)}`;
-      }
-
-      const response = await fetch(url, {
-        method: 'POST',
-        headers: {
-          'Authorization': `Bearer ${token}`,
+      await blockDocMutation({
+        variables: {
+          path: selectedDoc,
+          reason: blockReason || undefined,
+        },
+        context: {
+          headers: {
+            authorization: `Bearer ${token}`,
+          },
         },
       });
-
-
-      if (response.ok) {
-        const data = await response.json();
-        setShowBlockModal(false);
-        setSelectedDoc(null);
-        setBlockReason('');
-        await loadDocs(token);
-      } else {
-        const errorData = await response.json();
-        alert(`Erro ao bloquear: ${errorData.error || 'Erro desconhecido'}`);
-      }
+      setShowBlockModal(false);
+      setSelectedDoc(null);
+      setBlockReason('');
+      refetchDocs();
     } catch (error: any) {
       alert('Erro ao bloquear documento: ' + error.message);
     } finally {
@@ -200,48 +156,36 @@ export default function AdminPage() {
 
   // Trocar senha do admin
   const handleChangeAdminPassword = async () => {
-    const token = localStorage.getItem('adminToken');
-    if (!token) return;
-
-    if (!currentPasswordInput || !newPasswordInput) {
+    if (!token || !currentPasswordInput || !newPasswordInput) {
       setChangePasswordError('Preencha todos os campos');
       return;
     }
 
     try {
-      const url = `/api/admin/change-password?currentPassword=${encodeURIComponent(currentPasswordInput)}&newPassword=${encodeURIComponent(newPasswordInput)}`;
-      const response = await fetch(url, {
-        method: 'POST',
-        headers: {
-          'Authorization': `Bearer ${token}`,
+      await changePasswordMutation({
+        variables: {
+          currentPassword: currentPasswordInput,
+          newPassword: newPasswordInput,
+        },
+        context: {
+          headers: {
+            authorization: `Bearer ${token}`,
+          },
         },
       });
-
-      if (response.ok) {
-        const data = await response.json();
-        alert(data.message || 'Senha alterada com sucesso!');
-        setShowChangeAdminPasswordModal(false);
-        setCurrentPasswordInput('');
-        setNewPasswordInput('');
-        setChangePasswordError('');
-      } else {
-        const errorData = await response.json();
-        setChangePasswordError(errorData.error || 'Erro ao trocar senha');
-      }
-    } catch (error) {
-      setChangePasswordError('Erro ao trocar senha');
+      alert('Senha alterada com sucesso!');
+      setShowChangeAdminPasswordModal(false);
+      setCurrentPasswordInput('');
+      setNewPasswordInput('');
+      setChangePasswordError('');
+    } catch (error: any) {
+      setChangePasswordError(error.message || 'Erro ao trocar senha');
     }
   };
 
   // Trocar senha de um documento
   const handleChangeDocPassword = async () => {
-    const token = localStorage.getItem('adminToken');
-    
-    if (!token || !selectedDoc) {
-      return;
-    }
-
-    if (!newPasswordInput || !confirmPasswordInput) {
+    if (!token || !selectedDoc || !newPasswordInput || !confirmPasswordInput) {
       setChangePasswordError('Preencha todos os campos');
       return;
     }
@@ -252,29 +196,25 @@ export default function AdminPage() {
     }
 
     try {
-      const url = `/api/admin/change-doc-password-admin?path=${encodeURIComponent(selectedDoc)}&newPassword=${encodeURIComponent(newPasswordInput)}`;
-      
-      const response = await fetch(url, {
-        method: 'POST',
-        headers: {
-          'Authorization': `Bearer ${token}`,
+      await changeDocPasswordMutation({
+        variables: {
+          path: selectedDoc,
+          newPassword: newPasswordInput,
+        },
+        context: {
+          headers: {
+            authorization: `Bearer ${token}`,
+          },
         },
       });
-
-
-      if (response.ok) {
-        alert('Senha do documento alterada com sucesso!');
-        setShowChangeDocPasswordModal(false);
-        setSelectedDoc(null);
-        setNewPasswordInput('');
-        setConfirmPasswordInput('');
-        setChangePasswordError('');
-      } else {
-        const errorData = await response.json();
-        setChangePasswordError(errorData.error || 'Erro ao trocar senha');
-      }
-    } catch (error) {
-      setChangePasswordError('Erro ao trocar senha');
+      alert('Senha do documento alterada com sucesso!');
+      setShowChangeDocPasswordModal(false);
+      setSelectedDoc(null);
+      setNewPasswordInput('');
+      setConfirmPasswordInput('');
+      setChangePasswordError('');
+    } catch (error: any) {
+      setChangePasswordError(error.message || 'Erro ao trocar senha');
     }
   };
 
@@ -282,13 +222,14 @@ export default function AdminPage() {
   useEffect(() => {
     const savedToken = localStorage.getItem('adminToken');
     if (savedToken) {
-      loadDocs(savedToken);
+      setToken(savedToken);
+      setIsAuthenticated(true);
     }
   }, []);
 
   // Filtrar e ordenar documentos
   const filteredDocs = docs
-    .filter(doc => doc.path.toLowerCase().includes(searchTerm.toLowerCase()))
+    .filter((doc) => doc.path.toLowerCase().includes(searchTerm.toLowerCase()))
     .sort((a, b) => {
       switch (sortBy) {
         case 'pageviews':
@@ -334,11 +275,7 @@ export default function AdminPage() {
                 </div>
               )}
               <div className="card-actions justify-end mt-6">
-                <button 
-                  type="submit" 
-                  className="btn btn-primary w-full"
-                  disabled={isLoggingIn || !password}
-                >
+                <button type="submit" className="btn btn-primary w-full" disabled={isLoggingIn || !password}>
                   {isLoggingIn ? (
                     <>
                       <span className="loading loading-spinner loading-sm"></span>
@@ -366,10 +303,7 @@ export default function AdminPage() {
             <p className="text-base-content/70">Gerenciar documentos do sistema</p>
           </div>
           <div className="flex gap-2">
-            <button
-              className="btn btn-ghost"
-              onClick={() => router.push('/')}
-            >
+            <button className="btn btn-ghost" onClick={() => router.push('/')}>
               Voltar ao Site
             </button>
             <button
@@ -388,6 +322,7 @@ export default function AdminPage() {
               onClick={() => {
                 localStorage.removeItem('adminToken');
                 setIsAuthenticated(false);
+                setToken(null);
                 setPassword('');
               }}
             >
@@ -404,13 +339,11 @@ export default function AdminPage() {
           </div>
           <div className="stat">
             <div className="stat-title">Bloqueados</div>
-            <div className="stat-value text-error">{docs.filter(d => d.isBlocked).length}</div>
+            <div className="stat-value text-error">{docs.filter((d) => d.isBlocked).length}</div>
           </div>
           <div className="stat">
             <div className="stat-title">Total de Visualizações</div>
-            <div className="stat-value text-primary">
-              {docs.reduce((sum, d) => sum + d.totalPageviews, 0)}
-            </div>
+            <div className="stat-value text-primary">{docs.reduce((sum, d) => sum + d.totalPageviews, 0)}</div>
           </div>
         </div>
 
@@ -428,23 +361,13 @@ export default function AdminPage() {
                 />
               </div>
               <div className="form-control">
-                <select
-                  className="select select-bordered"
-                  value={sortBy}
-                  onChange={(e) => setSortBy(e.target.value as any)}
-                >
+                <select className="select select-bordered" value={sortBy} onChange={(e) => setSortBy(e.target.value as any)}>
                   <option value="path">Ordenar por URL</option>
                   <option value="pageviews">Ordenar por Visualizações</option>
                   <option value="updated">Ordenar por Data</option>
                 </select>
               </div>
-              <button
-                className="btn btn-primary"
-                onClick={() => {
-                  const token = localStorage.getItem('adminToken');
-                  if (token) loadDocs(token);
-                }}
-              >
+              <button className="btn btn-primary" onClick={() => refetchDocs()}>
                 Atualizar
               </button>
             </div>
@@ -467,7 +390,7 @@ export default function AdminPage() {
                   </tr>
                 </thead>
                 <tbody>
-                  {loading ? (
+                  {docsLoading ? (
                     <tr>
                       <td colSpan={6} className="text-center py-8">
                         <span className="loading loading-spinner loading-lg"></span>
@@ -483,46 +406,35 @@ export default function AdminPage() {
                     filteredDocs.map((doc) => (
                       <tr key={doc.path}>
                         <td>
-                          <a
-                            href={`/${doc.path}`}
-                            target="_blank"
-                            rel="noopener noreferrer"
-                            className="link link-primary font-mono text-sm"
-                          >
+                          <a href={`/${doc.path}`} target="_blank" rel="noopener noreferrer" className="link link-primary font-mono text-sm">
                             /{doc.path}
                           </a>
                         </td>
                         <td>
                           <div className="text-sm">
-                            <div>Únicas: <strong>{doc.uniquePageviews}</strong></div>
-                            <div>Total: <strong>{doc.totalPageviews}</strong></div>
+                            <div>
+                              Únicas: <strong>{doc.uniquePageviews}</strong>
+                            </div>
+                            <div>
+                              Total: <strong>{doc.totalPageviews}</strong>
+                            </div>
                           </div>
                         </td>
                         <td className="text-sm">{formatDate(doc.updatedAt)}</td>
                         <td>
                           <div className="flex gap-1">
-                            {doc.requiresPassword && (
-                              <div className="badge badge-warning badge-sm">Gravação</div>
-                            )}
-                            {doc.requiresReadPassword && (
-                              <div className="badge badge-error badge-sm">Leitura</div>
-                            )}
-                            {!doc.requiresPassword && !doc.requiresReadPassword && (
-                              <div className="badge badge-ghost badge-sm">Aberto</div>
-                            )}
+                            {doc.requiresPassword && <div className="badge badge-warning badge-sm">Gravação</div>}
+                            {doc.requiresReadPassword && <div className="badge badge-error badge-sm">Leitura</div>}
+                            {!doc.requiresPassword && !doc.requiresReadPassword && <div className="badge badge-ghost badge-sm">Aberto</div>}
                           </div>
                         </td>
                         <td>
                           {doc.isBlocked ? (
                             <div className="tooltip" data-tip={doc.blockedReason || 'Sem motivo'}>
-                              <div className="badge badge-error gap-2">
-                                🚫 Bloqueado
-                              </div>
+                              <div className="badge badge-error gap-2">🚫 Bloqueado</div>
                             </div>
                           ) : (
-                            <div className="badge badge-success gap-2">
-                              ✓ Ativo
-                            </div>
+                            <div className="badge badge-success gap-2">✓ Ativo</div>
                           )}
                         </td>
                         <td>
@@ -593,11 +505,7 @@ export default function AdminPage() {
                 >
                   Cancelar
                 </button>
-                <button
-                  className="btn btn-error"
-                  onClick={handleConfirmBlock}
-                  disabled={isBlocking}
-                >
+                <button className="btn btn-error" onClick={handleConfirmBlock} disabled={isBlocking}>
                   {isBlocking ? (
                     <>
                       <span className="loading loading-spinner loading-sm"></span>
@@ -619,10 +527,8 @@ export default function AdminPage() {
           <div className="card w-96 bg-base-100 shadow-xl">
             <div className="card-body">
               <h3 className="card-title">Trocar Senha do Admin</h3>
-              <p className="text-sm text-base-content/70 mb-4">
-                Altere a senha de acesso ao painel de administração
-              </p>
-              
+              <p className="text-sm text-base-content/70 mb-4">Altere a senha de acesso ao painel de administração</p>
+
               {changePasswordError && (
                 <div className="alert alert-error mb-4">
                   <span>{changePasswordError}</span>
@@ -673,10 +579,7 @@ export default function AdminPage() {
                 >
                   Cancelar
                 </button>
-                <button
-                  className="btn btn-primary"
-                  onClick={handleChangeAdminPassword}
-                >
+                <button className="btn btn-primary" onClick={handleChangeAdminPassword}>
                   Alterar Senha
                 </button>
               </div>
@@ -694,7 +597,7 @@ export default function AdminPage() {
               <p className="text-sm text-base-content/70 mb-4">
                 Documento: <strong className="font-mono">/{selectedDoc}</strong>
               </p>
-              
+
               {changePasswordError && (
                 <div className="alert alert-error mb-4">
                   <span>{changePasswordError}</span>
@@ -758,10 +661,7 @@ export default function AdminPage() {
                 >
                   Cancelar
                 </button>
-                <button
-                  className="btn btn-primary"
-                  onClick={handleChangeDocPassword}
-                >
+                <button className="btn btn-primary" onClick={handleChangeDocPassword}>
                   Alterar Senha
                 </button>
               </div>

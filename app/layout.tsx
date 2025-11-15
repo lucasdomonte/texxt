@@ -1,8 +1,12 @@
 import type { Metadata } from 'next';
+import { Inter } from 'next/font/google';
 import './globals.css';
+import { ApolloWrapper } from '@/components/ApolloWrapper';
+
+const inter = Inter({ subsets: ['latin'] });
 
 export const metadata: Metadata = {
-  title: 'texxt',
+  title: 'texxt - Editor colaborativo',
   description: 'Editor de texto colaborativo em tempo real',
 };
 
@@ -12,9 +16,10 @@ export default function RootLayout({
   children: React.ReactNode;
 }) {
   return (
-    <html lang="pt-BR" data-theme="light">
-      <body>{children}</body>
+    <html lang="pt-BR">
+      <body className={inter.className}>
+        <ApolloWrapper>{children}</ApolloWrapper>
+      </body>
     </html>
   );
 }
-
